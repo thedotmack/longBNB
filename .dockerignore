@@ -1,0 +1,11 @@
+.git
+data
+plans
+node_modules
+.DS_Store
+*.md
+.env
+.env.*
+*.pem
+*.p8
+*.key

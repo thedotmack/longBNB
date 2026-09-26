@@ -1,0 +1,10 @@
+{
+  "name": "longbnb",
+  "version": "0.1.0",
+  "description": "Month-to-month stays, no deposit — calendar-first Airbnb stay discovery",
+  "license": "MIT",
+  "author": "Alex Newman",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" }
+}
