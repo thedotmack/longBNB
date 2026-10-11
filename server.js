@@ -6,6 +6,9 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { HOUR, refreshState, startRefreshScheduler } = require("./lib/refresh");
+const { normalizeCriteria, findMatches, createAssistant } = require("./lib/assistant");
+const { parseSearchPage } = require("./lib/search-page");
 
 /* optional local .env (does not override already-set env vars; .env is gitignored) */
 function loadEnvFile(file) {
@@ -26,6 +29,11 @@ loadEnvFile(path.join(__dirname, ".env"));
 
 /* ---------------- config (env-overridable) ---------------- */
 const PORT = process.env.PORT || 3000;
+const HOSTED = process.env.HOSTED === "1";
+const HARVEST_DISABLED = process.env.HARVEST_DISABLED === "1";
+const HARVEST_TOKEN = process.env.HARVEST_TOKEN || "";
+const REFRESH_MS = Math.max(1, Number(process.env.REFRESH_HOURS) || 24) * HOUR;
+const RETRY_MS = Math.max(1, Number(process.env.REFRESH_RETRY_HOURS) || 1) * HOUR;
 const DEFAULT_CITIES = (process.env.CITIES || "San-Francisco--CA,Oakland--CA,Daly-City--CA").split(",");
 const MAX_PRICE = parseInt(process.env.MAX_PRICE || "0", 10); // optional global sanity cap; 0 = disabled
 /* disjoint price bands searched per city/anchor; "min-max", trailing dash = open top */
@@ -45,11 +53,11 @@ if (!PRICE_BANDS) {
   PRICE_BANDS = parseBands(DEFAULT_BANDS);
 }
 const bandLabel = b => b.min + "-" + (b.max ?? "");
-const SEARCH_CACHE_V = 2; // schema version of cached slim() search results — bump when slim()'s shape changes
+const SEARCH_CACHE_V = 3; // v3: every advertised search page, not just page one
 const WINDOW_DAYS = parseInt(process.env.WINDOW_DAYS || "48", 10); // runway must start within N days
 const MIN_RUNWAY = parseInt(process.env.MIN_RUNWAY || "28", 10);
-const CAL_TTL_MS = parseFloat(process.env.CAL_TTL_HOURS || "6") * 3600e3;   // don't re-hit a listing's calendar within this window
-const SEARCH_TTL_MS = parseFloat(process.env.SEARCH_TTL_HOURS || "3") * 3600e3; // don't re-run a city search within this window
+const CAL_TTL_MS = parseFloat(process.env.CAL_TTL_HOURS || (HOSTED ? "20" : "6")) * 3600e3;
+const SEARCH_TTL_MS = parseFloat(process.env.SEARCH_TTL_HOURS || (HOSTED ? "20" : "3")) * 3600e3;
 const CACHE_PRUNE_MS = 7 * 24 * 3600e3;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 const DATA_FILE = path.join(DATA_DIR, "listings.json");
@@ -144,10 +152,17 @@ function appleSecret() {
 }
 
 function rawBody(req) {
-  return new Promise(resolve => {
+  return new Promise((resolve, reject) => {
     let b = "";
-    req.on("data", c => { b += c; if (b.length > 1e5) req.destroy(); });
+    let tooLarge = false;
+    req.on("data", c => {
+      if (tooLarge) return;
+      b += c;
+      if (Buffer.byteLength(b) > 1e5) { tooLarge = true; reject(Object.assign(new Error("Request body too large"), { statusCode: 413 })); }
+    });
     req.on("end", () => resolve(b));
+    req.on("error", reject);
+    req.on("aborted", () => reject(new Error("Request aborted")));
   });
 }
 
@@ -196,7 +211,7 @@ async function oauthCallback(p, req, res, u) {
 }
 
 /* ---------------- persistent db (listings + calendar cache) ---------------- */
-let DB = { harvestedAt: null, cities: DEFAULT_CITIES.slice(), listings: [], calCache: {}, searchCache: {} };
+let DB = { harvestedAt: null, cityHarvestedAt: {}, refresh: {}, cities: DEFAULT_CITIES.slice(), listings: [], calCache: {}, searchCache: {} };
 try {
   const j = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
   DB = Object.assign(DB, j);
@@ -205,13 +220,21 @@ try {
   /* drop legacy city-only keys and any entry whose cached shape predates the current slim() schema */
   for (const [k, e] of Object.entries(DB.searchCache)) if (!k.includes("|") || e?.v !== SEARCH_CACHE_V) delete DB.searchCache[k];
   if (!Array.isArray(DB.cities) || !DB.cities.length) DB.cities = DEFAULT_CITIES.slice();
+  if (HOSTED) DB.cities = DEFAULT_CITIES.slice();
+  DB.cityHarvestedAt = DB.cityHarvestedAt || {};
+  DB.refresh = DB.refresh || {};
+  for (const city of DB.cities) if (!Object.hasOwn(DB.cityHarvestedAt, city)) DB.cityHarvestedAt[city] = DB.harvestedAt;
 } catch {}
+
+const getRefreshState = () => refreshState(DB, { intervalMs: REFRESH_MS, retryMs: RETRY_MS, disabled: HARVEST_DISABLED });
+const assistant = createAssistant({ apiKey: process.env.OPENROUTER_API_KEY });
 
 /* pre-serialized client payload (no caches) so /api/listings is a memory read */
 function pack() {
   return JSON.stringify({
     harvestedAt: DB.harvestedAt,
-    config: { MAX_PRICE, WINDOW_DAYS, MIN_RUNWAY },
+    config: { MAX_PRICE, WINDOW_DAYS, MIN_RUNWAY, STALE_HOURS: REFRESH_MS / HOUR, hosted: HOSTED, aiEnabled: assistant.enabled },
+    cityHarvestedAt: DB.cityHarvestedAt,
     cities: DB.cities,
     listings: DB.listings,
   });
@@ -223,7 +246,7 @@ function saveDB() {
 }
 
 /* ---------------- harvest: search pass ---------------- */
-/* null = failure (bad status / blob missing / parse error) — never cache; [] = genuinely empty band — cacheable */
+/* Follow only server-provided cursors; an incomplete traversal is never cached as complete. */
 async function searchCity(city, monthlyStart, band) {
   const q = new URLSearchParams({
     "refinement_paths[]": "/homes",
@@ -237,22 +260,33 @@ async function searchCity(city, monthlyStart, band) {
   });
   if (band.min > 0) q.set("price_min", String(band.min));
   if (band.max != null) q.set("price_max", String(band.max));
-  const url = `https://www.airbnb.com/s/${encodeURIComponent(city)}/homes?${q}`;
-  const res = await fetch(url, { headers: { "User-Agent": UA, Accept: "text/html" } });
-  if (!res.ok) return null;
-  const html = await res.text();
-  const m = html.match(/<script id="data-deferred-state-0"[^>]*>([\s\S]*?)<\/script>/);
-  if (!m) return null;
-  let root;
-  try { root = JSON.parse(m[1]); } catch { return null; }
-  const results = [];
-  (function walk(o) {
-    if (o && typeof o === "object") {
-      if (!Array.isArray(o) && o.demandStayListing) results.push(o);
-      for (const v of Object.values(o)) walk(v);
+  const results = [], queued = [null], seen = new Set();
+  const firstIds = new Set();
+  for (let page = 0; page < queued.length; page++) {
+    if (page >= 50) return { results, complete: false };
+    const cursor = queued[page];
+    if (cursor) q.set("cursor", cursor);
+    if (page) await sleep(1200);
+    try {
+      const url = `https://www.airbnb.com/s/${encodeURIComponent(city)}/homes?${q}`;
+      const res = await fetch(url, { headers: { "User-Agent": UA, Accept: "text/html" }, signal: AbortSignal.timeout(30000) });
+      if (!res.ok) throw new Error(`search HTTP ${res.status}`);
+      const parsed = parseSearchPage(await res.text());
+      const pageIds = parsed.results.map(r => r.demandStayListing?.id).filter(Boolean);
+      if (page && pageIds.length && pageIds.every(id => firstIds.has(id))) return { results, complete: false }; // ignored cursor
+      results.push(...parsed.results);
+      if (!page) {
+        pageIds.forEach(id => firstIds.add(id));
+        // The first advertised cursor represents the page already received.
+        if (parsed.cursors[0]) seen.add(parsed.cursors[0]);
+      }
+      for (const next of parsed.cursors) if (!seen.has(next)) { seen.add(next); queued.push(next); }
+    } catch (error) {
+      if (!page) throw error;
+      return { results, complete: false };
     }
-  })(root);
-  return results;
+  }
+  return { results, complete: true };
 }
 
 /* project a raw search result down to the flat shape the validate loop reads; bump SEARCH_CACHE_V
@@ -284,13 +318,15 @@ async function getCalendar(listingId) {
   const variables = JSON.stringify({ request: { count: 12, listingId: String(listingId), month: now.getMonth() + 1, year: now.getFullYear() } });
   const ext = JSON.stringify({ persistedQuery: { version: 1, sha256Hash: CAL_HASH } });
   const url = `https://www.airbnb.com/api/v3/PdpAvailabilityCalendar/${CAL_HASH}?operationName=PdpAvailabilityCalendar&locale=en&currency=USD&variables=${encodeURIComponent(variables)}&extensions=${encodeURIComponent(ext)}`;
-  const res = await fetch(url, { headers: { "User-Agent": UA, "X-Airbnb-Api-Key": API_KEY } });
+  const res = await fetch(url, { headers: { "User-Agent": UA, "X-Airbnb-Api-Key": API_KEY }, signal: AbortSignal.timeout(30000) });
   if (!res.ok) throw new Error(`calendar HTTP ${res.status}`);
   const d = await res.json();
-  const months = d?.data?.merlin?.pdpAvailabilityCalendar?.calendarMonths || [];
+  const months = d?.data?.merlin?.pdpAvailabilityCalendar?.calendarMonths;
+  if (d.errors?.length || !Array.isArray(months) || !months.length) throw new Error("calendar response missing availability");
   const days = [];
   for (const mo of months) for (const day of mo.days || []) days.push([day.calendarDate, !!day.available]);
-  return days;
+  if (!days.length) throw new Error("calendar response contains no days");
+  return days.sort((a, b) => a[0].localeCompare(b[0]));
 }
 
 /* contiguous open stretches: [[lengthDays, startDate], ...] */
@@ -310,11 +346,14 @@ const status = { running: false, phase: "idle", done: 0, total: 0, found: 0, cac
 const warn = msg => { if (status.warnings.length < 20) status.warnings.push(msg); console.log("[warn] " + msg); };
 
 async function harvest(citySubset) {
-  if (status.running) return false;
+  if (status.running || HARVEST_DISABLED) return false;
   const cities = (citySubset && citySubset.length ? citySubset : DB.cities).filter(c => DB.cities.includes(c));
   if (!cities.length) return false;
   Object.assign(status, { running: true, phase: "searching", done: 0, total: 0, found: 0, cached: 0, error: null, startedAt: new Date().toISOString(), cities, warnings: [] });
+  DB.refresh.lastAttemptAt = status.startedAt;
+  DB.refresh.lastError = null;
   try {
+    saveDB();
     const today = new Date();
     const todayS = d2s(today);
     const nowMs = Date.now();
@@ -353,7 +392,11 @@ async function harvest(citySubset) {
             warn(`search failed for ${city} $${label} @${anchor} (after retry)`);
             break;
           }
-          for (const r of rs) {
+          if (!rs.complete) {
+            ok = false;
+            warn(`incomplete pagination for ${city} $${label} @${anchor}`);
+          }
+          for (const r of rs.results) {
             const b64 = r.demandStayListing?.id || "";
             let lid = "";
             try { lid = Buffer.from(b64, "base64").toString("utf8").replace(/[^\d]/g, ""); } catch {}
@@ -362,7 +405,7 @@ async function harvest(citySubset) {
             bandResults.set(lid, s);
             if (!raw.has(lid)) raw.set(lid, { r: s, city });
           }
-          console.log(`[search] ${city} $${label} @${anchor}: ${rs.length} results (${raw.size} unique)`);
+          console.log(`[search] ${city} $${label} @${anchor}: ${rs.results.length} results (${raw.size} unique)`);
           await sleep(1200);
         }
         if (!ok) {
@@ -383,6 +426,8 @@ async function harvest(citySubset) {
     status.total = raw.size;
     const windowEnd = d2s(addD(today, WINDOW_DAYS));
     const out = [];
+    const previousListings = new Map(DB.listings.map(listing => [listing.id, listing]));
+    let calendarFailures = 0;
 
     for (const [lid, { r, city }] of raw) {
       status.done++;
@@ -424,13 +469,21 @@ async function harvest(citySubset) {
           lat: r.lat, lng: r.lng,
           city, area: labelOf(city),
           runwayDays: best[0], runwayStart: best[1],
+          checkedAt: DB.calCache[lid].checkedAt,
+          discoveredAt: previousListings.get(lid)?.discoveredAt || new Date().toISOString(),
         });
         status.found = out.length;
+        calendarFailures = 0;
         console.log(`[cal] ${lid}: ${labelOf(city)} $${monthly}/mo ${best[0]}d from ${best[1]}`);
       } catch (e) {
         /* a failed calendar check must not delete the listing from the site — merge this city instead of replacing it */
         failedCities.add(city);
         warn(`calendar failed for ${lid} (${labelOf(city)}): ${e.message}`);
+        if (++calendarFailures >= 3 || /HTTP (403|429)/.test(e.message)) {
+          for (const item of raw.values()) failedCities.add(item.city);
+          warn("Calendar checks stopped after repeated failures or rate limiting; keeping last good data.");
+          break;
+        }
       }
     }
 
@@ -438,6 +491,12 @@ async function harvest(citySubset) {
        (drop results for cities removed mid-harvest). A city whose pass was incomplete
        (failed bands / calendar errors) is merged by id instead of replaced, so a
        rate-limited harvest can't silently wipe previously-good listings. */
+    for (const city of cities) {
+      if (!out.some(l => l.city === city) && DB.listings.some(l => l.city === city)) {
+        failedCities.add(city);
+        warn(`empty result for ${city} — keeping last good listings until a complete check succeeds`);
+      }
+    }
     if (failedCities.size) warn(`incomplete harvest for ${[...failedCities].join(", ")} — merging instead of replacing their listings`);
     const outIds = new Set(out.map(l => l.id));
     DB.listings = DB.listings
@@ -446,11 +505,18 @@ async function harvest(citySubset) {
     /* prune stale caches */
     for (const [id, c] of Object.entries(DB.calCache)) if (nowMs - Date.parse(c.checkedAt) > CACHE_PRUNE_MS) delete DB.calCache[id];
     for (const [c, s] of Object.entries(DB.searchCache)) if (nowMs - Date.parse(s.at) > CACHE_PRUNE_MS) delete DB.searchCache[c];
-    DB.harvestedAt = new Date().toISOString();
+    const completedAt = new Date().toISOString();
+    for (const city of cities) if (!failedCities.has(city) && DB.cities.includes(city)) DB.cityHarvestedAt[city] = completedAt;
+    const fresh = DB.cities.map(city => Date.parse(DB.cityHarvestedAt[city]));
+    DB.harvestedAt = fresh.length && fresh.every(Number.isFinite) ? new Date(Math.min(...fresh)).toISOString() : null;
+    DB.refresh.lastCompletedAt = completedAt;
+    DB.refresh.lastError = failedCities.size ? "Some cities could not be refreshed. Keeping their last good listings." : null;
     saveDB();
     console.log(`[done] ${out.length} listings for ${cities.join(", ")} (${status.cached} calendars from cache) — ${DB.listings.length} total`);
     status.phase = "idle";
   } catch (e) {
+    DB.refresh.lastError = "Refresh failed. Keeping the last good listings.";
+    try { saveDB(); } catch (saveError) { console.error("[harvest] checkpoint failed:", saveError.message); }
     status.error = e.message;
     status.phase = "error";
     console.error("[harvest] fatal:", e);
@@ -464,15 +530,55 @@ async function harvest(citySubset) {
 const MIME = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".json": "application/json", ".png": "image/png", ".svg": "image/svg+xml" };
 const STATIC = new Map(); // in-memory static cache, invalidated by mtime
 
-const readBody = async req => { try { return JSON.parse(await rawBody(req) || "{}"); } catch { return {}; } };
+const readBody = async req => { try { return JSON.parse(await rawBody(req) || "{}"); } catch (error) { if (error instanceof SyntaxError) return {}; throw error; } };
 const json = (res, code, obj) => { res.statusCode = code; res.setHeader("Content-Type", "application/json"); res.end(JSON.stringify(obj)); };
+const publicStatus = () => ({ ...status, hosted: HOSTED, harvestDisabled: HARVEST_DISABLED, harvestedAt: DB.harvestedAt, cityHarvestedAt: DB.cityHarvestedAt, listings: DB.listings.length, firstRun: !DB.harvestedAt, ...getRefreshState() });
+function isHarvestAdmin(req) {
+  const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+  return !!HARVEST_TOKEN && Buffer.byteLength(token) === Buffer.byteLength(HARVEST_TOKEN) && crypto.timingSafeEqual(Buffer.from(token), Buffer.from(HARVEST_TOKEN));
+}
+const finderRequests = new Map();
+function allowFinder(req) {
+  const now = Date.now();
+  const ip = req.headers["fly-client-ip"] || req.socket.remoteAddress || "unknown";
+  const entry = finderRequests.get(ip);
+  if (entry && now - entry.at < 60000) return ++entry.count <= 15;
+  for (const [key, value] of finderRequests) if (now - value.at >= 60000) finderRequests.delete(key);
+  if (finderRequests.size >= 5000) return false;
+  finderRequests.set(ip, { at: now, count: 1 });
+  return true;
+}
 
-const server = http.createServer(async (req, res) => {
+// A streaming request keeps suspended Fly machines awake for the whole harvest.
+function streamHarvest(req, res, task) {
+  res.writeHead(200, { "Content-Type": "application/x-ndjson", "Cache-Control": "no-store", "X-Accel-Buffering": "no" });
+  const send = () => { if (!res.destroyed) res.write(JSON.stringify(publicStatus()) + "\n"); };
+  send();
+  const timer = setInterval(send, 10000);
+  const done = () => { clearInterval(timer); if (!res.destroyed) { send(); res.end(); } };
+  res.on("close", () => clearInterval(timer));
+  if (task) task.finally(done);
+  else {
+    const wait = setInterval(() => { if (!status.running) { clearInterval(wait); done(); } }, 1000);
+    res.on("close", () => clearInterval(wait));
+  }
+}
+
+const server = http.createServer((req, res) => {
+  handleRequest(req, res).catch(error => {
+    console.error("[http]", error.message);
+    if (!res.headersSent) json(res, error.statusCode || 500, { error: error.statusCode === 413 ? "Request body too large" : "Request failed. Please try again." });
+    else res.end();
+  });
+});
+async function handleRequest(req, res) {
   const u = new URL(req.url, "http://x");
+  if (u.pathname === "/healthz") return json(res, 200, { ok: true });
 
   /* ----- auth routes (open) ----- */
   if (u.pathname === "/auth/providers") return json(res, 200, { providers: Object.keys(PROVIDERS), guest: GUEST_OK });
   if (u.pathname === "/auth/guest" && req.method === "POST") {
+    if (HOSTED) return json(res, 403, { error: "accounts are disabled on the public instance" });
     if (!GUEST_OK) return json(res, 403, { error: "guest login disabled" });
     const uid = "guest:" + crypto.randomBytes(6).toString("hex");
     USERS[uid] = { id: uid, provider: "guest", name: "Guest", email: null, avatar: null, favs: [], createdAt: new Date().toISOString() };
@@ -506,11 +612,16 @@ const server = http.createServer(async (req, res) => {
   if (u.pathname.startsWith("/api/")) {
     const user = getUser(req);
     if (u.pathname === "/api/me") {
+      if (HOSTED) return json(res, 200, { hosted: true, user: null });
       return user
         ? json(res, 200, { user: { id: user.id, provider: user.provider, name: user.name, email: user.email, avatar: user.avatar } })
         : json(res, 401, { error: "auth required" });
     }
-    if (!user) return json(res, 401, { error: "auth required" });
+    const publicRead = HOSTED && req.method === "GET" && ["/api/listings", "/api/status"].includes(u.pathname);
+    const publicFinder = HOSTED && req.method === "POST" && u.pathname === "/api/assistant";
+    const administrative = u.pathname === "/api/harvest" || u.pathname === "/api/cities" || u.pathname.startsWith("/api/cities/");
+    if (administrative && (HOSTED || HARVEST_TOKEN) && !isHarvestAdmin(req)) return json(res, 401, { error: "admin token required" });
+    if (!user && !publicRead && !publicFinder && !(administrative && isHarvestAdmin(req))) return json(res, 401, { error: "auth required" });
 
     if (u.pathname === "/api/favorites" && req.method === "GET") return json(res, 200, { favs: user.favs || [] });
     const favm = u.pathname.match(/^\/api\/favorites\/(\d+)$/);
@@ -528,17 +639,42 @@ const server = http.createServer(async (req, res) => {
     res.setHeader("Cache-Control", "no-store");
     return res.end(CLIENT_JSON);
   }
-  if (u.pathname === "/api/status") return json(res, 200, status);
+  if (u.pathname === "/api/status") return json(res, 200, publicStatus());
   if (u.pathname === "/api/harvest" && req.method === "POST") {
+    if (HARVEST_DISABLED) return json(res, 503, { error: "harvest disabled" });
+    if (u.searchParams.get("scheduled") === "1" && !status.running) {
+      const lastSuccess = Date.parse(getRefreshState().lastSuccessAt) || 0;
+      if (lastSuccess && Date.now() - lastSuccess < Math.min(REFRESH_MS, 20 * HOUR)) return json(res, 200, { ...publicStatus(), skipped: true });
+    }
     const started = !status.running;
-    harvest(); // fire and forget
+    const task = started ? harvest() : null;
+    if (u.searchParams.get("stream") === "1") return streamHarvest(req, res, task);
     return json(res, 200, { started });
+  }
+  if (u.pathname === "/api/assistant" && req.method === "POST") {
+    if (!allowFinder(req)) return json(res, 429, { error: "Too many searches. Try again in a minute." });
+    const body = await readBody(req);
+    if (!body || typeof body.message !== "string" || body.message.length > 1000 || (body.filters && (typeof body.filters !== "object" || Array.isArray(body.filters)))) return json(res, 400, { error: "Use a search message of at most 1,000 characters." });
+    try {
+      normalizeCriteria(body.filters || {}, DB.cities); // reject invalid fields before any model call
+      if (!body.message.trim() && !Object.keys(body.filters || {}).length) return json(res, 400, { error: "Add a city, budget, or a short description to start." });
+      const interpretation = await assistant.interpret(body.message, DB.cities);
+      const criteria = normalizeCriteria({ ...interpretation.criteria, ...(body.filters || {}) }, DB.cities);
+      const matches = findMatches(DB.listings, criteria);
+      const unavailable = criteria.location && !criteria.cities.length;
+      const message = unavailable
+        ? `We do not track ${criteria.location} yet. Available cities: ${DB.cities.map(labelOf).join("; ")}.`
+        : matches.length
+          ? `${matches.length} matching ${matches.length === 1 ? "stay" : "stays"}, cheapest first${criteria.maxMonthly != null ? `, at or below $${criteria.maxMonthly.toLocaleString()}/month` : ""}.`
+          : "No current listings match those filters. Try another city, a higher budget, or a shorter stay.";
+      return json(res, 200, { message, criteria, mode: interpretation.mode, notice: interpretation.notice || null, matches: matches.slice(0, 12), total: matches.length, freshness: getRefreshState() });
+    } catch (error) { return json(res, 400, { error: error.message }); }
   }
   if (u.pathname === "/api/cities" && req.method === "POST") {
     const { city } = await readBody(req);
     const slug = slugify(city);
     if (!slug) return json(res, 400, { error: "city required — e.g. \"Portland, OR\"" });
-    if (!DB.cities.includes(slug)) { DB.cities.push(slug); saveDB(); }
+    if (!DB.cities.includes(slug)) { DB.cities.push(slug); DB.cityHarvestedAt[slug] = null; saveDB(); }
     const started = !status.running;
     if (started) harvest([slug]); // fire and forget
     return json(res, 200, { added: slug, label: labelOf(slug), started });
@@ -546,6 +682,7 @@ const server = http.createServer(async (req, res) => {
   if (u.pathname.startsWith("/api/cities/") && req.method === "DELETE") {
     const slug = decodeURIComponent(u.pathname.slice("/api/cities/".length));
     DB.cities = DB.cities.filter(c => c !== slug);
+    delete DB.cityHarvestedAt[slug];
     DB.listings = DB.listings.filter(l => l.city !== slug);
     for (const k of Object.keys(DB.searchCache)) if (k.startsWith(slug + "|")) delete DB.searchCache[k];
     saveDB();
@@ -563,10 +700,10 @@ const server = http.createServer(async (req, res) => {
     return res.end(hit.buf);
   }
   res.statusCode = 404; res.end("not found");
-});
+}
 
 server.listen(PORT, () => {
   console.log(`longBNB on http://localhost:${PORT}`);
   console.log(`config: cities=${DB.cities.join("|")} bands=${PRICE_BANDS.map(bandLabel).join(",")} maxPrice=${MAX_PRICE ? "$" + MAX_PRICE : "off"} window=${WINDOW_DAYS}d minRunway=${MIN_RUNWAY}d calTTL=${CAL_TTL_MS / 3600e3}h`);
-  if (!DB.listings.length) { console.log("no cached data — starting first harvest…"); harvest(); }
+  startRefreshScheduler({ getState: getRefreshState, isRunning: () => status.running, run: harvest });
 });
