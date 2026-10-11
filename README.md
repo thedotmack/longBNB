@@ -17,6 +17,34 @@ day they open up.
 - Daily background refresh with per-city freshness, restart catch-up, and a scheduled wake-up for the public Fly instance
 - Follows Airbnb's advertised search pages and deduplicates listings across pages, dates, and price bands
 - A natural-language finder for location, monthly budget, move-in date, stay length, and room type
+- New York metro coverage, including nearby New Jersey results, alongside San Francisco, Oakland, and Daly City
+
+## Cities
+
+New installations and the public hosted configuration track San Francisco,
+Oakland, Daly City, and the New York metro area (`New-York--NY`). NYC participates in
+the same daily search and calendar refresh. The finder understands “NYC,”
+“New York,” “New York City,” and “New York metro.” “Bay Area” stays limited to the three Bay
+Area cities; choose “all cities” to include New York too.
+
+New York is a metro-area search, not a five-borough boundary filter. Keep
+the nearby New Jersey and suburban listings returned by Airbnb's New York
+search, including results without map pins. This does not search all of New
+Jersey or promise a specific commute time. Results retain their source
+locality (for example, “Jersey City · New York metro”); an unknown location
+is labeled unconfirmed rather than presented as NYC proper.
+
+[NYC Department of City Planning borough boundaries](https://data.cityofnewyork.us/City-Government/Borough-Boundaries/wh2p-dxnf)
+are used only to label the five boroughs. `lib/nyc-boroughs.json` is a bundled
+snapshot of that public GeoJSON, with coordinates rounded to six decimal
+places; it never excludes listings. There is no runtime geocoding service
+or API fee. Pins are approximate, so confirm the location on Airbnb.
+
+Deploy the updated hosted configuration to add NYC to an existing public
+instance. Its first NYC refresh is due immediately even when the Bay Area
+data is fresh. An existing standalone installation keeps its saved city
+selection; add `New York, NY` with **+ city** to opt in. `CITIES` still replaces
+the defaults for a new installation or hosted instance.
 
 ## Tech stack
 
@@ -126,7 +154,7 @@ Example: `CITIES=Oakland--CA,Berkeley--CA node server.js`
 |---|---|---|
 | `PORT` | `3000` | server port |
 | `DATA_DIR` | `./data` | listings, users, and session secret |
-| `CITIES` | `San-Francisco--CA,Oakland--CA,Daly-City--CA` | comma-sep Airbnb city slugs |
+| `CITIES` | `San-Francisco--CA,Oakland--CA,Daly-City--CA,New-York--NY` | comma-sep Airbnb city slugs |
 | `PRICE_BANDS` | `0-1100,1100-1600,1600-2400,2400-3500,3500-5200,5200-` | disjoint $/mo search bands (trailing `-` = open top); each band is searched separately to beat Airbnb's ~20-results-per-page cap |
 | `MAX_PRICE` | `0` (off) | optional global max $/month sanity cap |
 | `WINDOW_DAYS` | `48` | runway must start within N days of today |

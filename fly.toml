@@ -7,7 +7,7 @@ primary_region = 'sjc'
 [build]
 
 [env]
-  CITIES = 'San-Francisco--CA,Oakland--CA,Daly-City--CA'
+  CITIES = 'San-Francisco--CA,Oakland--CA,Daly-City--CA,New-York--NY'
   DATA_DIR = '/data'
   MIN_RUNWAY = '28'
   PRICE_BANDS = '0-1100,1100-1600,1600-2400,2400-3500,3500-5200,5200-'

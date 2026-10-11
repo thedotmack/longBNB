@@ -12,7 +12,7 @@
   function setCities(cities) {
     $("finderCities").replaceChildren(...cities.map(city => {
       const option = document.createElement("option");
-      option.value = city.split("--").map(part => part.replace(/-/g, " ")).join(", ");
+      option.value = city === "New-York--NY" ? "New York metro" : city.split("--").map(part => part.replace(/-/g, " ")).join(", ");
       return option;
     }));
   }
