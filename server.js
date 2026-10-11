@@ -9,6 +9,7 @@ const crypto = require("crypto");
 const { HOUR, refreshState, startRefreshScheduler } = require("./lib/refresh");
 const { normalizeCriteria, findMatches, createAssistant } = require("./lib/assistant");
 const { parseSearchPage } = require("./lib/search-page");
+const { NYC, DEFAULT_CITIES: CITY_DEFAULTS, isWithinCity, nycBorough } = require("./lib/cities");
 
 /* optional local .env (does not override already-set env vars; .env is gitignored) */
 function loadEnvFile(file) {
@@ -34,7 +35,7 @@ const HARVEST_DISABLED = process.env.HARVEST_DISABLED === "1";
 const HARVEST_TOKEN = process.env.HARVEST_TOKEN || "";
 const REFRESH_MS = Math.max(1, Number(process.env.REFRESH_HOURS) || 24) * HOUR;
 const RETRY_MS = Math.max(1, Number(process.env.REFRESH_RETRY_HOURS) || 1) * HOUR;
-const DEFAULT_CITIES = (process.env.CITIES || "San-Francisco--CA,Oakland--CA,Daly-City--CA").split(",");
+const DEFAULT_CITIES = (process.env.CITIES || CITY_DEFAULTS.join(",")).split(",").map(city => city.trim()).filter(Boolean);
 const MAX_PRICE = parseInt(process.env.MAX_PRICE || "0", 10); // optional global sanity cap; 0 = disabled
 /* disjoint price bands searched per city/anchor; "min-max", trailing dash = open top */
 const DEFAULT_BANDS = "0-1100,1100-1600,1600-2400,2400-3500,3500-5200,5200-";
@@ -214,6 +215,7 @@ async function oauthCallback(p, req, res, u) {
 let DB = { harvestedAt: null, cityHarvestedAt: {}, refresh: {}, cities: DEFAULT_CITIES.slice(), listings: [], calCache: {}, searchCache: {} };
 try {
   const j = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+  const savedCities = Array.isArray(j.cities) ? j.cities : [...new Set((j.listings || []).map(listing => listing.city))];
   DB = Object.assign(DB, j);
   DB.calCache = DB.calCache || {};
   DB.searchCache = DB.searchCache || {};
@@ -223,7 +225,9 @@ try {
   if (HOSTED) DB.cities = DEFAULT_CITIES.slice();
   DB.cityHarvestedAt = DB.cityHarvestedAt || {};
   DB.refresh = DB.refresh || {};
-  for (const city of DB.cities) if (!Object.hasOwn(DB.cityHarvestedAt, city)) DB.cityHarvestedAt[city] = DB.harvestedAt;
+  // New coverage must be due immediately, not inherit another city's freshness.
+  for (const city of DB.cities) if (!Object.hasOwn(DB.cityHarvestedAt, city)) DB.cityHarvestedAt[city] = savedCities.includes(city) ? DB.harvestedAt : null;
+  DB.listings = DB.listings.filter(listing => isWithinCity(listing.city, listing));
 } catch {}
 
 const getRefreshState = () => refreshState(DB, { intervalMs: REFRESH_MS, retryMs: RETRY_MS, disabled: HARVEST_DISABLED });
@@ -371,7 +375,7 @@ async function harvest(citySubset) {
         const key = city + "|" + label;
         const sc = DB.searchCache[key];
         if (sc && nowMs - Date.parse(sc.at) < SEARCH_TTL_MS && Array.isArray(sc.results)) {
-          for (const r of sc.results) if (!raw.has(r.__lid)) raw.set(r.__lid, { r, city });
+          for (const r of sc.results) if (isWithinCity(city, r) && !raw.has(r.__lid)) raw.set(r.__lid, { r, city });
           console.log(`[search] ${city} $${label}: ${sc.results.length} results (cache)`);
           continue;
         }
@@ -402,6 +406,7 @@ async function harvest(citySubset) {
             try { lid = Buffer.from(b64, "base64").toString("utf8").replace(/[^\d]/g, ""); } catch {}
             if (!lid || bandResults.has(lid)) continue;
             const s = slim(r, lid);
+            if (!isWithinCity(city, s)) continue;
             bandResults.set(lid, s);
             if (!raw.has(lid)) raw.set(lid, { r: s, city });
           }
@@ -467,7 +472,7 @@ async function harvest(citySubset) {
           monthly,
           imgs: r.imgs,
           lat: r.lat, lng: r.lng,
-          city, area: labelOf(city),
+          city, area: city === NYC ? nycBorough(r.lat, r.lng) + ", NYC" : labelOf(city),
           runwayDays: best[0], runwayStart: best[1],
           checkedAt: DB.calCache[lid].checkedAt,
           discoveredAt: previousListings.get(lid)?.discoveredAt || new Date().toISOString(),
