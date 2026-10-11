@@ -88,19 +88,32 @@ coverage message instead of unrelated results.
 
 Without a key, a small built-in parser handles the common requests with no
 external AI call. To enable broader language interpretation, set
-`OPENROUTER_API_KEY` on the server. The only model used is
+`OPENROUTER_API_KEY` on the server, or save a personal OpenRouter key under
+**Optional AI settings** in the finder when no server key is configured.
+The server key always takes precedence and is never sent to the browser.
+Personal keys are saved in that browser's local storage, not shared across
+devices. They are sent in the search POST body to LongBNB, then to OpenRouter;
+they are never saved to server files, logs, URLs, or responses. Use HTTPS
+(localhost also works). **Remove saved key** clears it from that browser.
+Only save personal keys on a browser profile you control.
+
+The only model used is
 [`openrouter/free`](https://openrouter.ai/docs/guides/routing/routers/free-router):
 there is no selectable paid model or paid fallback. It receives the short
 search request and available city names, not the listings, account data, or
 chat history. Explicit form values and locally parsed budget/date constraints
 take precedence over model output.
 
-Free AI calls have a 12-second timeout, a 40-request daily application cap,
+Free AI calls have a 12-second timeout, a 40-request daily cap per key,
 in-flight request deduplication, a bounded cache, and a cooldown after errors.
 The finder falls back to its built-in parser on missing credentials, rate
 limits, or outages. OpenRouter's own free limits still apply. The UI's free
 search label concerns inference; hosting and network costs remain those of
 the existing deployment.
+
+Usage, caches, and in-flight deduplication are isolated per credential digest;
+raw browser keys only live for the active request. At most 100 credentials
+are tracked per server process per UTC day; additional keys use local parsing.
 
 ## Run it locally
 

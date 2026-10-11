@@ -8,6 +8,43 @@
   const dollars = new Intl.NumberFormat(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 0 });
   let submitting = false;
   let lastRevision = null;
+  const keyStorage = "longbnb.openrouterApiKey";
+  const secureOrigin = location.protocol === "https:" || ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname);
+  let serverAI = null, clientApiKey = "";
+  try { clientApiKey = localStorage.getItem(keyStorage) || ""; } catch {}
+
+  function setAIConfig(config) {
+    serverAI = !!config.aiEnabled;
+    $("finderAiEntry").hidden = serverAI || !secureOrigin;
+    $("finderSaveKey").hidden = serverAI || !secureOrigin;
+    $("finderRemoveKey").disabled = !clientApiKey;
+    $("finderApiKey").value = "";
+    $("finderAiMode").textContent = serverAI
+      ? "AI is provided by this site. Your browser key is not used."
+      : secureOrigin ? "Search works without a key. Add your own key for free AI language help."
+        : "Search works without a key. Open this site over HTTPS to save and use an AI key.";
+    $("finderKeyStatus").textContent = clientApiKey ? (serverAI ? "A browser key is saved, but is not being used." : "A key is saved in this browser.") : "No browser key saved.";
+  }
+
+  $("finderSaveKey").addEventListener("click", () => {
+    if (serverAI !== false || !secureOrigin) return;
+    const value = $("finderApiKey").value.trim();
+    if (!/^[\x21-\x7e]{8,512}$/.test(value)) { $("finderKeyStatus").textContent = "Paste a valid OpenRouter API key to save it."; return; }
+    try {
+      localStorage.setItem(keyStorage, value);
+      clientApiKey = value;
+      setAIConfig({ aiEnabled: serverAI });
+    } catch { $("finderKeyStatus").textContent = "This browser blocked saving the key. Check your storage settings."; }
+  });
+  $("finderRemoveKey").addEventListener("click", () => {
+    try {
+      localStorage.removeItem(keyStorage);
+      clientApiKey = "";
+      $("finderApiKey").value = "";
+      $("finderRemoveKey").disabled = true;
+      $("finderKeyStatus").textContent = "Browser key removed.";
+    } catch { $("finderKeyStatus").textContent = "This browser blocked removing the key. Clear this site's storage in your browser settings."; }
+  });
 
   function setCities(cities) {
     $("finderCities").replaceChildren(...cities.map(city => {
@@ -69,7 +106,9 @@
     submitting = true; $("finderSubmit").disabled = true; status.classList.remove("error");
     status.textContent = "Finding stays in the latest available listings…"; results.replaceChildren();
     try {
-      const response = await fetch("/api/assistant", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message, filters }), signal: AbortSignal.timeout(20000) });
+      const body = { message, filters };
+      if (serverAI === false && secureOrigin && clientApiKey) body.clientApiKey = clientApiKey;
+      const response = await fetch("/api/assistant", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(20000) });
       if (response.status === 401) { status.textContent = "Sign in to use the finder."; return; }
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "Search is unavailable. Please try again.");
@@ -82,7 +121,7 @@
     finally { submitting = false; $("finderSubmit").disabled = false; }
   });
 
-  window.LongBNBFinder = { setCities, setRefresh };
+  window.LongBNBFinder = { setCities, setRefresh, setAIConfig };
   // Refresh an open page's status without triggering a scrape or an AI request.
   async function refreshStatus() {
     if (document.hidden) return;

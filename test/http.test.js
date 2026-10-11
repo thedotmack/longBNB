@@ -7,7 +7,7 @@ const { spawn } = require("node:child_process");
 const { once } = require("node:events");
 const net = require("node:net");
 
-async function startApp(t, { stale = false, disabled = true } = {}) {
+async function startApp(t, { stale = false, disabled = true, apiKey = "" } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "longbnb-test-"));
   const now = Date.now();
   fs.writeFileSync(path.join(dir, "listings.json"), JSON.stringify({
@@ -19,9 +19,13 @@ async function startApp(t, { stale = false, disabled = true } = {}) {
   // Deterministic upstream fixture: advertised page 2 has a new listing and a duplicate.
   fs.writeFileSync(mock, `
     const fs = require('node:fs');
-    global.fetch = async input => {
+    global.fetch = async (input, options = {}) => {
       const url = new URL(input);
       fs.appendFileSync(${JSON.stringify(path.join(dir, "requests.log"))}, url.pathname + ' ' + (url.searchParams.get('cursor') || '') + '\\n');
+      if (url.hostname === 'openrouter.ai') {
+        const location = options.headers.Authorization === 'Bearer server-test-key' ? 'Oakland' : 'San Francisco';
+        return Response.json({ choices: [{ message: { content: JSON.stringify({ location }) } }] });
+      }
       if (url.hostname !== 'www.airbnb.com') throw new Error('unexpected network');
       if (url.pathname.includes('/api/v3/')) {
         const request = JSON.parse(url.searchParams.get('variables')).request;
@@ -39,7 +43,7 @@ async function startApp(t, { stale = false, disabled = true } = {}) {
   const port = socket.address().port; await new Promise(resolve => socket.close(resolve));
   const child = spawn(process.execPath, ["--require", mock, "server.js"], {
     cwd: path.resolve(__dirname, ".."),
-    env: { ...process.env, PORT: String(port), DATA_DIR: dir, HOSTED: "1", HARVEST_DISABLED: disabled ? "1" : "0", HARVEST_TOKEN: "test-admin-only", OPENROUTER_API_KEY: "", CITIES: "San-Francisco--CA", PRICE_BANDS: "0-2000", CAL_TTL_HOURS: "0", SEARCH_TTL_HOURS: "0" },
+    env: { ...process.env, PORT: String(port), DATA_DIR: dir, HOSTED: "1", HARVEST_DISABLED: disabled ? "1" : "0", HARVEST_TOKEN: "test-admin-only", OPENROUTER_API_KEY: apiKey, CITIES: "San-Francisco--CA", PRICE_BANDS: "0-2000", CAL_TTL_HOURS: "0", SEARCH_TTL_HOURS: "0" },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let logs = ""; child.stdout.on("data", x => { logs += x; }); child.stderr.on("data", x => { logs += x; });
@@ -102,4 +106,34 @@ test("a stale startup catches up, follows page 2, and an overlapping stream join
   const retained = JSON.parse(fs.readFileSync(path.join(dir, "listings.json")));
   assert.equal(retained.harvestedAt, before);
   assert.equal(retained.listings.length, 2);
+});
+
+test("browser AI key is request-scoped, validated, and never exposed or persisted", async t => {
+  const { base, dir, logs } = await startApp(t);
+  const search = await fetch(base + "/api/assistant", { method: "POST", body: JSON.stringify({ message: "a cheap place", clientApiKey: "browser-test-key" }) });
+  const text = await search.text();
+  assert.equal(search.status, 200);
+  assert.equal(search.headers.get("cache-control"), "no-store");
+  assert.equal(JSON.parse(text).mode, "ai");
+  assert.equal(JSON.parse(text).total, 1);
+  assert.ok(!text.includes("browser-test-key"));
+  assert.ok(!logs().includes("browser-test-key"));
+  assert.ok(!fs.readFileSync(path.join(dir, "listings.json"), "utf8").includes("browser-test-key"));
+  assert.equal((await (await fetch(base + "/api/listings")).json()).config.aiEnabled, false);
+  for (const clientApiKey of [{}, "short", "bad key with spaces", "x".repeat(513)]) {
+    assert.equal((await fetch(base + "/api/assistant", { method: "POST", body: JSON.stringify({ message: "a cheap place", clientApiKey }) })).status, 400);
+  }
+});
+
+test("server AI configuration ignores browser credentials and never exposes the server key", async t => {
+  const { base, logs } = await startApp(t, { apiKey: "server-test-key" });
+  const configText = await (await fetch(base + "/api/listings")).text();
+  assert.equal(JSON.parse(configText).config.aiEnabled, true);
+  assert.ok(!configText.includes("server-test-key"));
+  const response = await fetch(base + "/api/assistant", { method: "POST", body: JSON.stringify({ message: "a cheap place", clientApiKey: { ignored: true } }) });
+  const text = await response.text();
+  assert.equal(response.status, 200);
+  assert.equal(JSON.parse(text).criteria.location, "Oakland");
+  assert.ok(!text.includes("server-test-key"));
+  assert.ok(!logs().includes("server-test-key"));
 });
