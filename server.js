@@ -652,13 +652,18 @@ async function handleRequest(req, res) {
     return json(res, 200, { started });
   }
   if (u.pathname === "/api/assistant" && req.method === "POST") {
+    res.setHeader("Cache-Control", "no-store");
     if (!allowFinder(req)) return json(res, 429, { error: "Too many searches. Try again in a minute." });
     const body = await readBody(req);
     if (!body || typeof body.message !== "string" || body.message.length > 1000 || (body.filters && (typeof body.filters !== "object" || Array.isArray(body.filters)))) return json(res, 400, { error: "Use a search message of at most 1,000 characters." });
+    // A browser key is used only when the deployment has no server key. It is
+    // request-scoped: never written to DB, logs, URLs, or response payloads.
+    const clientApiKey = assistant.enabled ? "" : body.clientApiKey ?? "";
+    if (typeof clientApiKey !== "string" || (clientApiKey && !/^[\x21-\x7e]{8,512}$/.test(clientApiKey))) return json(res, 400, { error: "Enter a valid OpenRouter API key in AI settings." });
     try {
       normalizeCriteria(body.filters || {}, DB.cities); // reject invalid fields before any model call
       if (!body.message.trim() && !Object.keys(body.filters || {}).length) return json(res, 400, { error: "Add a city, budget, or a short description to start." });
-      const interpretation = await assistant.interpret(body.message, DB.cities);
+      const interpretation = await assistant.interpret(body.message, DB.cities, clientApiKey);
       const criteria = normalizeCriteria({ ...interpretation.criteria, ...(body.filters || {}) }, DB.cities);
       const matches = findMatches(DB.listings, criteria);
       const unavailable = criteria.location && !criteria.cities.length;

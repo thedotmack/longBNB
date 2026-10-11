@@ -94,3 +94,34 @@ test("simultaneous identical searches share one call and preserve a supplied dat
   assert.equal(results[0].criteria.moveIn, "2026-11-01");
   assert.equal(results[1].criteria.moveIn, "2026-11-01");
 });
+
+test("browser credentials have separate caches and quotas, with no paid fallback", async () => {
+  const calls = [];
+  const helper = createAssistant({ now: () => now, dailyLimit: 1, fetchImpl: async (url, options) => {
+    calls.push(options.headers.Authorization);
+    assert.equal(JSON.parse(options.body).model, "openrouter/free");
+    return Response.json({ choices: [{ message: { content: '{"location":"SF"}' } }] });
+  } });
+  const same = await Promise.all([helper.interpret("a cheap place", cities, "browser-one"), helper.interpret("a cheap place", cities, "browser-one")]);
+  assert.ok(same.every(result => result.mode === "ai"));
+  assert.equal((await helper.interpret("a cheap place", cities, "browser-two")).mode, "ai");
+  assert.equal((await helper.interpret("another place", cities, "browser-one")).mode, "local");
+  assert.deepEqual(calls, ["Bearer browser-one", "Bearer browser-two"]);
+});
+
+test("a configured server key always overrides a supplied browser key", async () => {
+  const helper = createAssistant({ apiKey: "server-key", now: () => now, fetchImpl: async (url, options) => {
+    assert.equal(options.headers.Authorization, "Bearer server-key");
+    return Response.json({ choices: [{ message: { content: '{"location":"SF"}' } }] });
+  } });
+  assert.equal((await helper.interpret("a cheap place", cities, "browser-key")).mode, "ai");
+});
+
+test("credential state is bounded and expires at the next UTC day", async () => {
+  let time = now;
+  const helper = createAssistant({ now: () => time, maxKeys: 1, fetchImpl: async () => Response.json({ choices: [{ message: { content: '{"location":"SF"}' } }] }) });
+  assert.equal((await helper.interpret("a cheap place", cities, "one")).mode, "ai");
+  assert.equal((await helper.interpret("a cheap place", cities, "two")).mode, "local");
+  time += 86400000;
+  assert.equal((await helper.interpret("a cheap place", cities, "two")).mode, "ai");
+});

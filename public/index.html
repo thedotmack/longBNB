@@ -378,6 +378,17 @@ main{min-width:0}
           <label>Stay length (days)<input id="finderDays" type="number" min="28" max="730" step="1" inputmode="numeric" placeholder="28"></label>
         </div></details>
       </form>
+      <details class="finder-options finder-ai"><summary>Optional AI settings</summary>
+        <p id="finderAiMode" class="finder-ai-note">Loading AI settings…</p>
+        <div id="finderAiEntry" hidden>
+          <label class="finder-label" for="finderApiKey">Your OpenRouter API key</label>
+          <input id="finderApiKey" type="password" maxlength="512" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Paste your key" aria-describedby="finderAiPrivacy">
+          <p id="finderAiPrivacy" class="finder-ai-note">Saved in this browser. Sent to LongBNB and OpenRouter only when you search. Only free models are used.</p>
+          <p class="finder-ai-note"><a href="https://openrouter.ai/settings/keys" target="_blank" rel="noopener noreferrer">Get an OpenRouter key ↗</a></p>
+        </div>
+        <div class="finder-ai-actions"><button id="finderSaveKey" type="button" hidden>Save key</button><button id="finderRemoveKey" type="button" disabled>Remove saved key</button></div>
+        <p id="finderKeyStatus" class="finder-ai-note" role="status" aria-live="polite"></p>
+      </details>
       <div id="finderStatus" class="finder-status" role="status" aria-live="polite">Tell us a city and monthly budget. We’ll find matching stays, cheapest first.</div>
       <div id="finderResults" class="finder-results"></div>
       <p id="refreshStatus" class="refresh-status" role="status" aria-live="polite"></p>
@@ -1361,6 +1372,7 @@ async function loadData(){
       : "no data yet";
     dataBadge(j.harvestedAt);
     window.LongBNBFinder?.setCities(CITIES);
+    window.LongBNBFinder?.setAIConfig(CFG);
     if (!DATA.length) await emptyState();
   }catch(e){ calBody.innerHTML = '<div class="empty">could not reach server — is server.js running?</div>'; }
 }

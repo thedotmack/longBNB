@@ -14,6 +14,11 @@
 .finder-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.65rem;margin:.5rem 0}
 .finder-fields label{font-size:.75rem;font-weight:600}
 .finder-fields input{margin-top:.3rem}
+.finder-ai-note{font-size:.75rem;line-height:1.5;color:var(--ink2);margin:.45rem 0}
+.finder-ai-actions{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.6rem}
+.finder-ai-actions button{min-height:44px;padding:.5rem .75rem;border:1px solid var(--line);border-radius:8px;background:var(--paper2);color:var(--ink);font-size:.75rem;font-weight:600}
+.finder-ai-actions button:disabled{opacity:.55;cursor:default}
+.finder [hidden]{display:none!important}
 .finder-status{font-size:.85rem;line-height:1.5;margin-top:.85rem;color:var(--ink2)}
 .finder-status.error{color:var(--accent-ink)}
 .finder-results{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.75rem}
