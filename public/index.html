@@ -452,7 +452,7 @@ const addD = (d,n) => { const x = new Date(d); x.setDate(x.getDate()+n); return 
 const MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"];
 const _n = new Date();
 const TODAY = new Date(_n.getFullYear(), _n.getMonth(), _n.getDate());
-const labelOf = slug => slug.split("--").map(p => p.replace(/-/g," ")).join(", ");
+const labelOf = slug => slug === "New-York--NY" ? "New York metro" : slug.split("--").map(p => p.replace(/-/g," ")).join(", ");
 
 function stayLabel(l){
   if (l.overYear) return "stay 1 year+";

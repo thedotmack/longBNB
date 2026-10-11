@@ -17,23 +17,28 @@ day they open up.
 - Daily background refresh with per-city freshness, restart catch-up, and a scheduled wake-up for the public Fly instance
 - Follows Airbnb's advertised search pages and deduplicates listings across pages, dates, and price bands
 - A natural-language finder for location, monthly budget, move-in date, stay length, and room type
-- New York City coverage alongside San Francisco, Oakland, and Daly City
+- New York metro coverage, including nearby New Jersey results, alongside San Francisco, Oakland, and Daly City
 
 ## Cities
 
 New installations and the public hosted configuration track San Francisco,
-Oakland, Daly City, and New York City (`New-York--NY`). NYC participates in
+Oakland, Daly City, and the New York metro area (`New-York--NY`). NYC participates in
 the same daily search and calendar refresh. The finder understands “NYC,”
-“New York,” and “New York City.” “Bay Area” stays limited to the three Bay
+“New York,” “New York City,” and “New York metro.” “Bay Area” stays limited to the three Bay
 Area cities; choose “all cities” to include New York too.
 
-New York search results can include nearby New Jersey listings. LongBNB
-keeps only results whose public map pins fall inside the five boroughs,
-using [NYC Department of City Planning borough boundaries](https://data.cityofnewyork.us/City-Government/Borough-Boundaries/wh2p-dxnf)
-(water areas included). `lib/nyc-boroughs.json` is a bundled snapshot of that
-public GeoJSON, with coordinates rounded to six decimal places; there is no
-runtime geocoding service or API fee. Pins are approximate, so confirm the
-location on Airbnb. Listings without a usable NYC pin are excluded.
+New York is a metro-area search, not a five-borough boundary filter. Keep
+the nearby New Jersey and suburban listings returned by Airbnb's New York
+search, including results without map pins. This does not search all of New
+Jersey or promise a specific commute time. Results retain their source
+locality (for example, “Jersey City · New York metro”); an unknown location
+is labeled unconfirmed rather than presented as NYC proper.
+
+[NYC Department of City Planning borough boundaries](https://data.cityofnewyork.us/City-Government/Borough-Boundaries/wh2p-dxnf)
+are used only to label the five boroughs. `lib/nyc-boroughs.json` is a bundled
+snapshot of that public GeoJSON, with coordinates rounded to six decimal
+places; it never excludes listings. There is no runtime geocoding service
+or API fee. Pins are approximate, so confirm the location on Airbnb.
 
 Deploy the updated hosted configuration to add NYC to an existing public
 instance. Its first NYC refresh is due immediately even when the Bay Area

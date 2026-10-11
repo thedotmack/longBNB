@@ -9,7 +9,7 @@ const crypto = require("crypto");
 const { HOUR, refreshState, startRefreshScheduler } = require("./lib/refresh");
 const { normalizeCriteria, findMatches, createAssistant } = require("./lib/assistant");
 const { parseSearchPage } = require("./lib/search-page");
-const { NYC, DEFAULT_CITIES: CITY_DEFAULTS, isWithinCity, nycBorough } = require("./lib/cities");
+const { DEFAULT_CITIES: CITY_DEFAULTS, listingArea } = require("./lib/cities");
 
 /* optional local .env (does not override already-set env vars; .env is gitignored) */
 function loadEnvFile(file) {
@@ -227,7 +227,6 @@ try {
   DB.refresh = DB.refresh || {};
   // New coverage must be due immediately, not inherit another city's freshness.
   for (const city of DB.cities) if (!Object.hasOwn(DB.cityHarvestedAt, city)) DB.cityHarvestedAt[city] = savedCities.includes(city) ? DB.harvestedAt : null;
-  DB.listings = DB.listings.filter(listing => isWithinCity(listing.city, listing));
 } catch {}
 
 const getRefreshState = () => refreshState(DB, { intervalMs: REFRESH_MS, retryMs: RETRY_MS, disabled: HARVEST_DISABLED });
@@ -375,7 +374,7 @@ async function harvest(citySubset) {
         const key = city + "|" + label;
         const sc = DB.searchCache[key];
         if (sc && nowMs - Date.parse(sc.at) < SEARCH_TTL_MS && Array.isArray(sc.results)) {
-          for (const r of sc.results) if (isWithinCity(city, r) && !raw.has(r.__lid)) raw.set(r.__lid, { r, city });
+          for (const r of sc.results) if (!raw.has(r.__lid)) raw.set(r.__lid, { r, city });
           console.log(`[search] ${city} $${label}: ${sc.results.length} results (cache)`);
           continue;
         }
@@ -406,7 +405,6 @@ async function harvest(citySubset) {
             try { lid = Buffer.from(b64, "base64").toString("utf8").replace(/[^\d]/g, ""); } catch {}
             if (!lid || bandResults.has(lid)) continue;
             const s = slim(r, lid);
-            if (!isWithinCity(city, s)) continue;
             bandResults.set(lid, s);
             if (!raw.has(lid)) raw.set(lid, { r: s, city });
           }
@@ -472,7 +470,7 @@ async function harvest(citySubset) {
           monthly,
           imgs: r.imgs,
           lat: r.lat, lng: r.lng,
-          city, area: city === NYC ? nycBorough(r.lat, r.lng) + ", NYC" : labelOf(city),
+          city, area: listingArea(city, r),
           runwayDays: best[0], runwayStart: best[1],
           checkedAt: DB.calCache[lid].checkedAt,
           discoveredAt: previousListings.get(lid)?.discoveredAt || new Date().toISOString(),
