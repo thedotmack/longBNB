@@ -14,6 +14,9 @@ day they open up.
 - Dark mode, favorites, and swipeable photo carousels
 - Optional 1-click OAuth (Google / GitHub / Apple); guest login otherwise
 - Zero npm dependencies — Node 18+ is enough
+- Daily background refresh with per-city freshness, restart catch-up, and a scheduled wake-up for the public Fly instance
+- Follows Airbnb's advertised search pages and deduplicates listings across pages, dates, and price bands
+- A natural-language finder for location, monthly budget, move-in date, stay length, and room type
 
 ## Tech stack
 
@@ -30,7 +33,74 @@ As actually used (nothing else is required):
 | Deploy | Dockerfile (`node:20-slim`) + Fly.io `fly.toml` |
 | Harvest | Public Airbnb HTML search + `PdpAvailabilityCalendar` GraphQL |
 
-There is no database, no frontend build, and no Stripe / Supabase / Resend / OpenAI.
+There is no database, no frontend build, and no required paid AI service.
+
+## Daily updates
+
+The server checks every minute for cities last successfully refreshed at least
+`REFRESH_HOURS` ago (24 by default), including on startup. Successful and failed
+checks are recorded separately. Incomplete searches, broken calendars, or empty
+results never erase previously good listings or mark those cities fresh.
+Failed checks wait at least `REFRESH_RETRY_HOURS` (one hour by default) before retrying.
+`/api/status` exposes per-city timestamps, stale state, the next due time, and any
+last error. The interface shows when data needs a refresh.
+
+An in-process timer cannot wake a suspended machine. For the existing public
+instance at <https://longbnb.fly.dev>, `.github/workflows/daily-refresh.yml`
+calls the authenticated streaming refresh endpoint each morning. Its two later
+attempts are skipped once that day's refresh succeeds. The streaming response
+keeps Fly awake until the job finishes. Requests share an existing harvest
+instead of launching duplicates.
+
+To activate the hosted schedule:
+
+1. Deploy this revision with `fly deploy --config fly.hosted.toml` using access
+   to the existing `longbnb` app. The configuration retains its suspended,
+   single-machine design and existing `longbnb_data` volume; no new app or
+   volume is needed.
+2. Set the repository's `HARVEST_TOKEN` Actions secret to the **same existing
+   secret** used by the Fly app. Never commit it. Optionally set repository
+   variable `LONG_BNB_URL` when hosting at a different URL.
+3. Merge the workflow onto the default branch, enable Actions schedules, and
+   run “Refresh LongBNB listings” once from Actions. Verify the run succeeds and
+   the public status endpoint has a recent success for every configured city.
+
+The schedule runs at 13:17 UTC (06:17 Pacific daylight time / 05:17 Pacific
+standard time), with retry opportunities at 14:17 and 15:17 UTC. GitHub can
+delay scheduled jobs and disables schedules in public repositories after
+60 days without activity; re-enable the workflow if that happens. A running
+server's own timer and startup checks also catch up, but cannot wake an idle
+Fly machine. Monitor Actions and the public freshness indicator.
+
+The scraper covers the configured cities, date anchors, and monthly price bands.
+It follows every returned page cursor (a 50-page safety ceiling is reported as
+incomplete), rather than stopping at page one. Airbnb controls which inventory
+it exposes; this cannot guarantee every Airbnb property or real-time availability.
+
+## Find a place, without paid model calls
+
+Type a request such as “A room in SF under $1,500 for 2 months,” or enter the
+city, budget, dates, and duration directly. The finder returns actual cached
+listings, cheapest first. Budget, city, room type, and minimum remaining stay
+length are applied in code. Prices are monthly USD estimates; always confirm
+fees, price and availability on Airbnb. An untracked city returns an explicit
+coverage message instead of unrelated results.
+
+Without a key, a small built-in parser handles the common requests with no
+external AI call. To enable broader language interpretation, set
+`OPENROUTER_API_KEY` on the server. The only model used is
+[`openrouter/free`](https://openrouter.ai/docs/guides/routing/routers/free-router):
+there is no selectable paid model or paid fallback. It receives the short
+search request and available city names, not the listings, account data, or
+chat history. Explicit form values and locally parsed budget/date constraints
+take precedence over model output.
+
+Free AI calls have a 12-second timeout, a 40-request daily application cap,
+in-flight request deduplication, a bounded cache, and a cooldown after errors.
+The finder falls back to its built-in parser on missing credentials, rate
+limits, or outages. OpenRouter's own free limits still apply. The UI's free
+search label concerns inference; hosting and network costs remain those of
+the existing deployment.
 
 ## Run it locally
 
@@ -63,6 +133,12 @@ Example: `CITIES=Oakland--CA,Berkeley--CA node server.js`
 | `MIN_RUNWAY` | `28` | min contiguous open days to count |
 | `CAL_TTL_HOURS` | `6` | calendar cache freshness |
 | `SEARCH_TTL_HOURS` | `3` | search cache freshness (per city+band) |
+| `REFRESH_HOURS` | `24` | maximum age before automatic per-city catch-up |
+| `REFRESH_RETRY_HOURS` | `1` | minimum time between retry attempts |
+| `HARVEST_DISABLED` | unset | `1` disables manual and scheduled downloads |
+| `HOSTED` | unset | `1` enables public read-only browsing and local favorites; uses 20-hour search/calendar TTLs unless overridden |
+| `HARVEST_TOKEN` | unset | bearer token required for administrative writes in hosted mode |
+| `OPENROUTER_API_KEY` | unset | optional free-only language interpretation; never sent to the browser |
 | `AIRBNB_API_KEY` | Airbnb's public web-client key | override if Airbnb rotates the client key |
 | `CAL_HASH` | current `PdpAvailabilityCalendar` sha256 | override if calendars 404 (see Honest notes) |
 | `SESSION_SECRET` | generated into `DATA_DIR/session.secret` | HMAC key for session cookies |
@@ -131,6 +207,7 @@ Issues and pull requests are welcome. Keep the zero-dependency, single-process
 shape unless a change truly needs more. Before a PR:
 
 - `node --check server.js`
+- `node --test`
 - Don't commit `.env`, `data/`, keys, or harvested listings
 - Don't point `fly.toml` at a private live app
 

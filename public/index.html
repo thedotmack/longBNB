@@ -47,6 +47,12 @@ header{position:sticky;top:0;z-index:1000;background:color-mix(in srgb,var(--pap
 .pill .x{display:inline-block;margin-left:.4em;color:var(--ink2);font-weight:700}
 .pill .x:hover{color:var(--accent-ink)}
 .pill.add{border-style:dashed;border-color:var(--ink2)}
+/* hosted (read-only) instance: no city edits, no on-demand refresh — favorites live in localStorage */
+.hosted #addCityBtn,.hosted #refreshBtn,.hosted .pill .x{display:none}
+#dataBadge{cursor:default;color:var(--ink2)}
+#dataBadge.stale{border-color:var(--accent);color:var(--accent-ink)}
+.hosted-note{display:none;font-family:var(--mono);font-size:.6rem;color:var(--ink2);line-height:1.6;margin-top:.6rem}
+.hosted .hosted-note{display:block}
 .pill.fav.on{border-color:var(--accent);color:var(--accent-ink);background:var(--wash)}
 #userchip{display:flex;align-items:center;gap:.45rem;font-family:var(--mono);font-size:.7rem;border:1.5px solid var(--line);
   border-radius:999px;padding:.22rem .6rem .22rem .25rem;background:var(--paper)}
@@ -319,6 +325,7 @@ main{min-width:0}
 .thumbs{display:flex;gap:.4rem;margin-top:.8rem;overflow-x:auto;scrollbar-width:none}
 .thumbs img{width:86px;height:60px;object-fit:cover;border-radius:8px;border:1.5px solid var(--line);flex-shrink:0}
 </style>
+<link rel="stylesheet" href="/finder.css">
 </head>
 <body>
 
@@ -355,8 +362,26 @@ main{min-width:0}
       <button class="pill" id="avoidPill" style="display:none" title="zones drawn on the map hide listings"></button>
     </div>
     <button id="refreshBtn" class="pill refresh">⟳ refresh <span></span></button>
+    <span id="dataBadge" class="pill" style="display:none"></span>
+    <div class="hosted-note">hosted preview · cached, refreshed once daily · not affiliated with Airbnb · always recheck on Airbnb before booking</div>
   </aside>
   <main>
+    <section class="finder" aria-labelledby="finderTitle">
+      <div class="finder-heading"><div><p class="finder-kicker">YOUR NEXT PLACE</p><h1 id="finderTitle">Where do you want to live?</h1></div><span class="finder-cost">Free to search</span></div>
+      <form id="finderForm">
+        <label class="finder-label" for="finderMessage">Describe your ideal stay</label>
+        <div class="finder-query"><input id="finderMessage" maxlength="1000" placeholder="A room in San Francisco under $1,500 for 2 months" autocomplete="off"><button type="submit" id="finderSubmit">Find my place <span aria-hidden="true">↗</span></button></div>
+        <details class="finder-options"><summary>Location, budget &amp; dates</summary><div class="finder-fields">
+          <label>City<input id="finderCity" list="finderCities" placeholder="Any tracked city"><datalist id="finderCities"></datalist></label>
+          <label>Max $ / month<input id="finderBudget" type="number" min="1" max="100000" step="1" inputmode="numeric" placeholder="1,500"></label>
+          <label>Move-in date<input id="finderDate" type="date"></label>
+          <label>Stay length (days)<input id="finderDays" type="number" min="28" max="730" step="1" inputmode="numeric" placeholder="28"></label>
+        </div></details>
+      </form>
+      <div id="finderStatus" class="finder-status" role="status" aria-live="polite">Tell us a city and monthly budget. We’ll find matching stays, cheapest first.</div>
+      <div id="finderResults" class="finder-results"></div>
+      <p id="refreshStatus" class="refresh-status" role="status" aria-live="polite"></p>
+    </section>
     <div class="cal-head">
       <h2 id="calTitle"></h2>
       <span class="count-note" id="calNote"></span>
@@ -408,10 +433,12 @@ main{min-width:0}
 </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="/finder.js"></script>
 <script>
 let DATA = [];
 let CITIES = [];
 let USER = null;
+let HOSTED = false;    // read-only public instance: no accounts, favorites in localStorage
 let FAVS = new Set();
 let HARVESTED = new Date().toISOString();
 
@@ -527,11 +554,16 @@ function favPillSync(){
 }
 async function favToggle(l, e){
   if (e) e.stopPropagation();
-  try{
-    const r = await fetch("/api/favorites/" + l.id, { method:"POST" });
-    if (r.status === 401) return showLogin();
-    FAVS = new Set((await r.json()).favs);
-  }catch{ return; }
+  if (HOSTED){
+    FAVS.has(l.id) ? FAVS.delete(l.id) : FAVS.add(l.id);
+    try{ localStorage.rwFavs = JSON.stringify([...FAVS]); }catch{}
+  } else {
+    try{
+      const r = await fetch("/api/favorites/" + l.id, { method:"POST" });
+      if (r.status === 401) return showLogin();
+      FAVS = new Set((await r.json()).favs);
+    }catch{ return; }
+  }
   favPillSync(); render();
   if (state.sel && state.sel.id === l.id && document.getElementById("ov").classList.contains("on")) syncPanelFav(l);
 }
@@ -1217,7 +1249,9 @@ function openOv(l){
 
       <div class="foot">Monthly billing through Airbnb — pay month 1 now, next month next month. An open runway is the longest
       contiguous open stretch on the host's calendar${l.overYear?" (display capped at 1 year — available longer)":""}.
-      The green wash on the calendars behind this panel shows this stay's full runway.</div>
+      The green wash on the calendars behind this panel shows this stay's full runway.${HOSTED
+        ? "<br>Hosted preview — cached, refreshed once daily · not affiliated with Airbnb · always recheck on Airbnb before booking."
+        : ""}</div>
     </div>`;
   p.querySelector(".hero").prepend(carouselEl(l, true));
   p.querySelector(".pfav").onclick = e => favToggle(l, e);
@@ -1325,7 +1359,32 @@ async function loadData(){
     refreshBtn.querySelector("span").textContent = DATA.length
       ? "data: " + new Date(HARVESTED).toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"})
       : "no data yet";
+    dataBadge(j.harvestedAt);
+    window.LongBNBFinder?.setCities(CITIES);
+    if (!DATA.length) await emptyState();
   }catch(e){ calBody.innerHTML = '<div class="empty">could not reach server — is server.js running?</div>'; }
+}
+/* "data from 3h ago" badge; red once older than the server's STALE_HOURS (the same rule /api/status uses) */
+function dataBadge(at){
+  const b = document.getElementById("dataBadge");
+  if (!at){ b.style.display = "none"; return; }
+  const h = (Date.now() - Date.parse(at)) / 3600e3;
+  const ago = h < 1 ? Math.max(1, Math.round(h*60)) + "m" : h < 48 ? Math.round(h) + "h" : Math.round(h/24) + "d";
+  b.textContent = "data from " + ago + " ago";
+  b.title = "harvested " + new Date(at).toLocaleString();
+  b.classList.toggle("stale", CFG.STALE_HOURS ? h > CFG.STALE_HOURS : false);
+  b.style.display = "";
+}
+/* nothing cached: say whether a first harvest is running (then follow it) or the next refresh will fill it in */
+async function emptyState(){
+  let s = null;
+  try{ s = await (await fetch("/api/status")).json(); }catch{}
+  if (s && (s.running || (s.firstRun && !s.harvestDisabled))){
+    calBody.innerHTML = '<div class="empty">First harvest is running — listings appear in about 10 minutes. This page updates itself.</div>';
+    pollStatus();
+  } else {
+    calBody.innerHTML = '<div class="empty">No listings cached yet — the next daily refresh will fill this in.</div>';
+  }
 }
 
 let polling = null;
@@ -1362,11 +1421,20 @@ initMaps();
   let me;
   try{ me = await fetch("/api/me"); }catch{ calBody.innerHTML = '<div class="empty">could not reach server — is server.js running?</div>'; return; }
   if (me.status === 401) return showLogin();
-  USER = (await me.json()).user;
-  renderUserChip();
-  try{ FAVS = new Set((await (await fetch("/api/favorites")).json()).favs || []); }catch{}
+  const j = await me.json();
+  HOSTED = !!j.hosted; USER = j.user;
+  if (HOSTED){
+    document.body.classList.add("hosted");
+    try{ const f = JSON.parse(localStorage.rwFavs || "[]"); if (Array.isArray(f)) FAVS = new Set(f.map(String)); }catch{}
+  } else {
+    renderUserChip();
+    try{ FAVS = new Set((await (await fetch("/api/favorites")).json()).favs || []); }catch{}
+  }
+  favPillSync();
   await loadData();
+  if (window.LongBNBFinder) window.LongBNBFinder.onRefresh = loadData;
   const s = await (await fetch("/api/status")).json().catch(()=>null);
+  window.LongBNBFinder?.setRefresh(s);
   if (s && s.running) pollStatus();
 })();
 </script>

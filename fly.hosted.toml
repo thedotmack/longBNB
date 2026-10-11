@@ -1,0 +1,32 @@
+# Existing public instance. Deploy with: fly deploy --config fly.hosted.toml
+app = 'longbnb'
+primary_region = 'sjc'
+
+[env]
+  HOSTED = '1'
+  PORT = '8080'
+  DATA_DIR = '/data'
+  CITIES = 'San-Francisco--CA,Oakland--CA,Daly-City--CA'
+  PRICE_BANDS = '0-1100,1100-1600,1600-2400,2400-3500,3500-5200,5200-'
+  MIN_RUNWAY = '28'
+  WINDOW_DAYS = '48'
+  REFRESH_HOURS = '24'
+  REFRESH_RETRY_HOURS = '1'
+  CAL_TTL_HOURS = '20'
+  SEARCH_TTL_HOURS = '20'
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'suspend'
+  auto_start_machines = true
+  min_machines_running = 0
+
+[[vm]]
+  size = 'shared-cpu-1x'
+  memory = '512mb'
+  cpus = 1
+
+[mounts]
+  source = 'longbnb_data'
+  destination = '/data'

@@ -1,0 +1,25 @@
+name: Refresh LongBNB listings
+on:
+  schedule:
+    # 06:17 Pacific daylight time / 05:17 Pacific standard time, with two retries.
+    # The endpoint skips the later runs once today's refresh succeeds.
+    - cron: '17 13,14,15 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: longbnb-daily-refresh
+  cancel-in-progress: false
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      LONG_BNB_URL: ${{ vars.LONG_BNB_URL || 'https://longbnb.fly.dev' }}
+      HARVEST_TOKEN: ${{ secrets.HARVEST_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: '20'
+      - run: node scripts/refresh.mjs
